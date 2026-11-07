@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+downloads/
+aria2c.exe
+ffmpeg.exe
+# Unfinished downloads, in case someone saves into this folder with -o .
+.*.parts/
+*.aria2
+*.part
+*.ts
+*.mp4
+failed.txt
