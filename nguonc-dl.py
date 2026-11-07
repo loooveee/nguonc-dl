@@ -4,22 +4,27 @@
 How it works
 ------------
 1. Movie page      scrape()              title, year and the episode list of every server.
-2. Stream link     resolve_episode()     the embed player hands out an AES-GCM encrypted bootstrap
+2. Stream link     open_episode()        the embed player hands out an AES-GCM encrypted bootstrap
                                          over HTTP/2, which leads to an encrypted HLS playlist.
-3. Clean playlist  clean_playlist()      picks the quality (-q) and drops ad segments.
-4. Size            estimate_size()       measures a few segments spread over the episode.
-5. Download        download_aria2()      aria2c, many segments at once (falls back to yt-dlp).
-6. Mux             remux_to_mp4()        ffmpeg joins the segments into an MP4 without re-encoding.
+3. Quality         pick_variant()        the highest quality by default (-q picks another one).
+4. Clean playlist  clean_playlist()      drops the ad segments spliced into the movie.
+5. Size            estimate_size()       measures a few segments spread over the episode;
+                   probe_resolution()    ffmpeg reads the real resolution from one segment.
+6. Download        download_aria2()      aria2c, many segments at once, broken segments are fetched
+                                         again (falls back to yt-dlp).
+7. Mux             make_mp4()            the segments are piped into ffmpeg, which writes the MP4
+                                         without re-encoding.
 
 Code map
 --------
 Console output   log(), colors, class Board (live progress bars)   (all user-facing text goes through t())
 HTTP             http_get(), h2_request() (curl or httpx with HTTP/2)
 Movie info       scrape()
-Stream           _bootstrap_playlist(), _legacy_playlist(), parse_variants(), clean_playlist()
-Size             estimate_size(), probe_qualities(), show_sizes()
-Download / mux   download_aria2(), download_ytdlp(), remux_to_mp4()
-Main flow        run(), main()
+Stream           class Source, open_episode(), parse_variants(), pick_variant(), clean_playlist()
+Size / quality   estimate_size(), probe_resolution(), probe_qualities()
+Names            build_filenames(), episode_labels(), parse_selection()
+Download / mux   download_aria2(), download_ytdlp(), make_mp4(), class Meter
+Main flow        class Job, resolve_jobs(), download_jobs(), show_sizes(), run(), main()
 
 Messages are bilingual: t("English", "Tiếng Việt"). Please add both when you add a message.
 """
@@ -31,6 +36,7 @@ import functools
 import hashlib
 import hmac
 import html as htmllib
+import importlib.util
 import json
 import os
 import re
@@ -45,6 +51,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -625,6 +632,22 @@ def scrape(movie_url: str) -> dict:
 # Stream
 # --------------------------------------------------------------------------- #
 
+# Waits longer than this for the server's rate limit are not worth it: the episode fails instead
+# and the next run of the same command picks it up.
+MAX_RATE_WAIT = 120
+
+
+class _NoBootstrap(ValueError):
+    pass
+
+
+class RateLimited(ValueError):
+    def __init__(self, seconds: int):
+        super().__init__(t(f"rate limited by the server (try again in {seconds} s)",
+                           f"bị máy chủ giới hạn lượt (thử lại sau {seconds} giây)"))
+        self.seconds = seconds
+
+
 def _decrypt_m3u8(encrypted: str, video_hash: str) -> str:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -659,11 +682,29 @@ def _open_bootstrap(envelope: dict, api_href: str) -> dict:
     return json.loads(plain.decode("utf-8"))
 
 
-class _NoBootstrap(ValueError):
-    pass
+class Source:
+    """Fetches the playlists of one episode the way its player does: the new embed server only
+    answers over HTTP/2, and any playlist (master or media) may be AES-GCM encrypted."""
+
+    def __init__(self, embed_url: str, video_hash: str = "", http2: bool = False):
+        self.embed_url = embed_url
+        self.video_hash = video_hash
+        self.http2 = http2
+
+    def fetch(self, url: str) -> str:
+        if self.http2:
+            status, body, _ = h2_request(url, referer=self.embed_url)
+            if status != 200:
+                raise ValueError(t(f"HTTP {status} while fetching the playlist", f"HTTP {status} khi tải playlist"))
+            text = body.decode("utf-8", "replace")
+        else:
+            text = http_get(url, referer=self.embed_url)
+        if "#ENC-AESGCM" in text:
+            text = _decrypt_m3u8(text, self.video_hash)
+        return text
 
 
-def _bootstrap_playlist(movie_url: str, embed_url: str) -> str:
+def _bootstrap_playlist(movie_url: str, embed_url: str) -> tuple[str, str, Source]:
     parsed = urllib.parse.urlparse(embed_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     host = parsed.hostname or "embed"
@@ -701,9 +742,11 @@ def _bootstrap_playlist(movie_url: str, embed_url: str) -> str:
         body=body,
     )
     if status in (429, 503):
-        wait_s = resp_headers.get("retry-after", "60")
-        raise ValueError(t(f"rate limited by the server (try again in {wait_s} s)",
-                           f"bị máy chủ giới hạn lượt (thử lại sau {wait_s} giây)"))
+        try:
+            seconds = int(resp_headers.get("retry-after", "60"))
+        except ValueError:
+            seconds = 60
+        raise RateLimited(seconds)
     if status != 200:
         detail = ""
         try:
@@ -715,7 +758,6 @@ def _bootstrap_playlist(movie_url: str, embed_url: str) -> str:
 
     envelope = json.loads(resp)
     opened = _open_bootstrap(envelope, api_href) if envelope.get("format") == "aesgcm-v1" else envelope
-    video_hash = opened.get("video") or video_hash
 
     preissued = opened.get("preissued") or {}
     if opened.get("turnstileEnabled") and not preissued:
@@ -727,30 +769,51 @@ def _bootstrap_playlist(movie_url: str, embed_url: str) -> str:
     if urllib.parse.urlparse(playlist_url).netloc != parsed.netloc:
         raise ValueError(t("playlist is on an unknown server", "playlist nằm trên máy chủ lạ"))
 
-    status, pl_bytes, _ = h2_request(playlist_url, referer=embed_url)
-    if status != 200:
-        raise ValueError(t(f"HTTP {status} while fetching the playlist", f"HTTP {status} khi tải playlist"))
-    playlist = pl_bytes.decode("utf-8", "replace")
-    if "#ENC-AESGCM" in playlist:
-        playlist = _decrypt_m3u8(playlist, video_hash)
-    return playlist
+    source = Source(embed_url, opened.get("video") or video_hash, http2=True)
+    return source.fetch(playlist_url), playlist_url, source
 
 
-def _legacy_playlist(movie_url: str, embed_url: str) -> tuple[Optional[str], str]:
-    """Old embed pages (data-obf). Returns (playlist text, playlist URL)."""
+def _legacy_playlist(movie_url: str, embed_url: str) -> tuple[str, str, Source]:
+    """Old embed pages (data-obf)."""
     page = http_get(embed_url, referer=movie_url)
     m = re.search(r'data-obf="([^"]+)"', page)
     if not m:
-        hint = "" if has_h2_client() else t(' (no HTTP/2: run `pip install "httpx[http2]"`)',
-                                            ' (thiếu HTTP/2: chạy `pip install "httpx[http2]"`)')
+        hint = "" if has_h2_client() else t(' (no HTTP/2: run `python -m pip install "httpx[http2]"`)',
+                                            ' (thiếu HTTP/2: chạy `python -m pip install "httpx[http2]"`)')
         raise ValueError(t("could not read the embed page", "không đọc được trang nhúng") + hint)
     data = json.loads(base64.b64decode(m.group(1)).decode())
     parsed = urllib.parse.urlparse(embed_url)
     url = f"{parsed.scheme}://{parsed.netloc}/{data['sUb']}.m3u8"
-    text = http_get(url, referer=embed_url)
-    if "#ENC-AESGCM" in text:
-        return _decrypt_m3u8(text, data.get("hD", "")), url
-    return None, url
+    source = Source(embed_url, data.get("hD", ""))
+    return source.fetch(url), url, source
+
+
+def open_episode(movie_url: str, embed_url: str) -> tuple[str, str, Source]:
+    """The top playlist of one episode: (text, URL, Source). Waits and retries when rate limited."""
+    for attempt in range(3):
+        try:
+            if has_h2_client():
+                try:
+                    return _bootstrap_playlist(movie_url, embed_url)
+                except _NoBootstrap:
+                    pass
+            return _legacy_playlist(movie_url, embed_url)
+        except RateLimited as ex:
+            if attempt == 2 or ex.seconds > MAX_RATE_WAIT:
+                raise
+            warn(t(f"Rate limited by the server, waiting {ex.seconds} s...",
+                   f"Bị máy chủ giới hạn lượt, đợi {ex.seconds} giây..."))
+            time.sleep(ex.seconds + 1)
+    raise AssertionError("unreachable")
+
+
+def resolution_label(width: int, height: int) -> str:
+    """'1080p' for 1920x1080, but also for 1920x800 (wide movies) or 1440x1080 (4:3)."""
+    for min_w, min_h, name in ((3800, 2100, "2160p"), (2500, 1400, "1440p"), (1900, 1000, "1080p"),
+                               (1260, 700, "720p"), (840, 470, "480p"), (630, 350, "360p")):
+        if width >= min_w or height >= min_h:
+            return name
+    return f"{height}p"
 
 
 def parse_variants(text: str, base_url: str) -> list[dict]:
@@ -764,18 +827,21 @@ def parse_variants(text: str, base_url: str) -> list[dict]:
             continue
         bw = re.search(r"[:,]BANDWIDTH=(\d+)", line)
         res = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
+        width, height = (int(res.group(1)), int(res.group(2))) if res else (0, 0)
         variants.append({
             "url": urllib.parse.urljoin(base_url, nxt),
             "bandwidth": int(bw.group(1)) if bw else 0,
-            "height": int(res.group(2)) if res else 0,
+            "width": width,
+            "height": height,
+            "p": int(resolution_label(width, height)[:-1]) if height else 0,
         })
-    variants.sort(key=lambda v: (v["height"], v["bandwidth"]), reverse=True)
+    variants.sort(key=lambda v: (v["p"], v["height"], v["bandwidth"]), reverse=True)
     return variants
 
 
 def quality_label(variant: dict) -> str:
     if variant.get("height"):
-        return f"{variant['height']}p"
+        return f"{resolution_label(variant['width'], variant['height'])} ({variant['width']}x{variant['height']})"
     if variant.get("bandwidth"):
         return f"{variant['bandwidth'] // 1000} kbps"
     return t("source", "gốc")
@@ -793,21 +859,7 @@ def pick_variant(variants: list[dict], quality: Optional[str]) -> dict:
         raise ValueError(t("invalid quality", "chất lượng không hợp lệ") + f": {quality!r}")
     target = int(m.group(1))
     # Closest one; on a tie take the higher one.
-    return min(variants, key=lambda v: (abs(v["height"] - target), -v["height"]))
-
-
-def fetch_media_playlist(url: str, referer: str, quality: Optional[str] = None) -> tuple[str, str, str]:
-    """Fetch a playlist; if it is a master playlist, follow the variant picked by `quality`.
-    Returns (text, URL, quality label)."""
-    label = ""
-    for _ in range(3):
-        text = http_get(url, referer=referer)
-        variants = parse_variants(text, url)
-        if not variants:
-            return text, url, label
-        chosen = pick_variant(variants, quality)
-        url, label = chosen["url"], quality_label(chosen)
-    raise ValueError(t("could not read the master playlist", "không đọc được playlist chọn chất lượng"))
+    return min(variants, key=lambda v: (abs(v["p"] - target), -v["p"], -v["bandwidth"]))
 
 
 def clean_playlist(text: str, base_url: str) -> tuple[str, int]:
@@ -852,38 +904,77 @@ def clean_playlist(text: str, base_url: str) -> tuple[str, int]:
     return "\n".join(out) + "\n", removed
 
 
-def resolve_episode(movie_url: str, ep: dict, tmp_dir: str, quality: Optional[str] = None) -> str:
-    """Path of a temporary .m3u8 for one episode (quality picked, ads removed)."""
-    embed_url = ep["embed"]
-    playlist, playlist_url = None, embed_url
-    if has_h2_client():
-        try:
-            playlist = _bootstrap_playlist(movie_url, embed_url)
-        except _NoBootstrap:
-            pass
-    if playlist is None:
-        playlist, playlist_url = _legacy_playlist(movie_url, embed_url)
-        if playlist is None:
-            ep["master"] = playlist_url
-            playlist, playlist_url, ep["quality"] = fetch_media_playlist(playlist_url, embed_url, quality)
-    ep["playlist"], ep["ads_removed"] = clean_playlist(playlist, playlist_url)
-    fd, path = tempfile.mkstemp(suffix=".m3u8", dir=tmp_dir)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(ep["playlist"])
-    return path
+def playlist_entries(playlist: str) -> list[tuple[str, float]]:
+    """(segment URL, duration in seconds) of a cleaned media playlist."""
+    entries, dur = [], 0.0
+    for raw in playlist.splitlines():
+        line = raw.strip()
+        if line.startswith("#EXTINF:"):
+            m = re.match(r"#EXTINF:([\d.]+)", line)
+            dur = float(m.group(1)) if m else 0.0
+        elif line and not line.startswith("#"):
+            entries.append((line, dur))
+            dur = 0.0
+    return entries
+
+
+def parse_segments(playlist: str) -> Optional[list[str]]:
+    """Segment URLs for aria2c, or None when the playlist needs yt-dlp
+    (AES-128 keys, byte ranges, init segment)."""
+    for line in playlist.splitlines():
+        if line.startswith(("#EXT-X-STREAM-INF", "#EXT-X-MAP", "#EXT-X-BYTERANGE")):
+            return None
+        if line.startswith("#EXT-X-KEY") and "METHOD=NONE" not in line:
+            return None
+    return [url for url, _ in playlist_entries(playlist)] or None
+
+
+def media_of(source: Source, variant: dict) -> tuple[str, str]:
+    """The media playlist of one quality of a master playlist: (text, URL)."""
+    media = source.fetch(variant["url"])
+    if parse_variants(media, variant["url"]):
+        raise ValueError(t("nested master playlist", "playlist chọn chất lượng lồng nhau"))
+    return media, variant["url"]
 
 
 # --------------------------------------------------------------------------- #
-# Size
+# Segments, size and resolution
 # --------------------------------------------------------------------------- #
+
+TS_PACKET = 188
+
+
+def ts_start(data: bytes) -> int:
+    """Where the MPEG-TS stream starts in a segment, or -1 if it is not one.
+    Some CDNs put a fake image header in front of the video data."""
+    if len(data) > 2 * TS_PACKET and data[0] == 0x47 and data[TS_PACKET] == 0x47:
+        return 0
+    for i in range(min(len(data) - 3 * TS_PACKET, 65536)):
+        if data[i] == 0x47 and data[i + TS_PACKET] == 0x47 and data[i + 2 * TS_PACKET] == 0x47:
+            return i
+    return -1
+
+
+def ts_payload(data: bytes) -> bytes:
+    start = ts_start(data)
+    if start < 0:
+        raise ValueError(t("a segment is not a video file", "một đoạn tải về không phải video"))
+    return data[start:] if start else data
+
+
+def _get(url: str, referer: str, method: str = "GET", byte_range: str = "", timeout: int = 15):
+    headers = {"User-Agent": USER_AGENT, "Referer": referer}
+    if byte_range:
+        headers["Range"] = f"bytes={byte_range}"
+    req = urllib.request.Request(url, method=method, headers=headers)
+    return urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX)
+
 
 def remote_size(url: str, referer: str) -> Optional[int]:
     """File size on the server (HEAD, or a 1-byte GET), without downloading it."""
-    for method, extra in (("HEAD", {}), ("GET", {"Range": "bytes=0-0"})):
-        req = urllib.request.Request(url, method=method, headers={
-            "User-Agent": USER_AGENT, "Referer": referer, **extra})
+    for method, byte_range in (("HEAD", ""), ("GET", "0-0")):
         try:
-            with urllib.request.urlopen(req, timeout=15, context=_SSL_CTX) as resp:
+            with _get(url, referer, method, byte_range) as resp:
                 m = re.search(r"/(\d+)\s*$", resp.headers.get("Content-Range", ""))
                 if m:
                     return int(m.group(1))
@@ -895,68 +986,80 @@ def remote_size(url: str, referer: str) -> Optional[int]:
     return None
 
 
-def estimate_size(playlist: str, base_url: str, referer: str, samples: int = 40) -> tuple[Optional[float], float]:
+def estimate_size(playlist: str, referer: str, samples: int = 40) -> tuple[Optional[float], float]:
     """Estimate the size of one episode from a few segments spread over it.
     Returns (bytes or None, duration in seconds)."""
-    urls, durs, dur = [], [], 0.0
-    for raw in playlist.splitlines():
-        line = raw.strip()
-        if line.startswith("#EXTINF:"):
-            m = re.match(r"#EXTINF:([\d.]+)", line)
-            dur = float(m.group(1)) if m else 0.0
-        elif line and not line.startswith("#"):
-            urls.append(urllib.parse.urljoin(base_url, line))
-            durs.append(dur)
-            dur = 0.0
-    total_dur = sum(durs)
+    entries = playlist_entries(playlist)
+    total_dur = sum(d for _, d in entries)
     # Byte ranges: every segment is part of the same file, so measuring them means nothing.
-    if not urls or "#EXT-X-BYTERANGE" in playlist:
+    if not entries or "#EXT-X-BYTERANGE" in playlist:
         return None, total_dur
 
-    n = min(samples, len(urls))
-    picks = sorted({round(i * (len(urls) - 1) / max(1, n - 1)) for i in range(n)})
+    n = min(samples, len(entries))
+    picks = sorted({round(i * (len(entries) - 1) / max(1, n - 1)) for i in range(n)})
     sizes: dict[int, int] = {}
 
     def probe(i):
-        size = remote_size(urls[i], referer)
+        size = remote_size(entries[i][0], referer)
         if size:
             sizes[i] = size
 
     run_parallel(probe, picks, 8)
     if not sizes:
         return None, total_dur
-    sampled_dur = sum(durs[i] for i in sizes)
+    sampled_dur = sum(entries[i][1] for i in sizes)
     if total_dur > 0 and sampled_dur > 0:
         return sum(sizes.values()) / sampled_dur * total_dur, total_dur
-    return sum(sizes.values()) / len(sizes) * len(urls), total_dur
+    return sum(sizes.values()) / len(sizes) * len(entries), total_dur
 
 
-def probe_qualities(movie_url: str, ep: dict) -> list[dict]:
+def probe_resolution(playlist: str, referer: str, ffmpeg: Optional[str]) -> Optional[tuple[int, int]]:
+    """Width and height of the video, read by ffmpeg from the start of one segment."""
+    entries = playlist_entries(playlist)
+    if not entries or not ffmpeg:
+        return None
+    try:
+        with _get(entries[len(entries) // 2][0], referer, byte_range="0-1048575", timeout=20) as resp:
+            data = ts_payload(resp.read())
+        proc = subprocess.run([ffmpeg, "-hide_banner", "-f", "mpegts", "-i", "pipe:0"],
+                              input=data, capture_output=True, timeout=30)
+    except Exception:
+        return None
+    m = re.search(r"Video: .*?, (\d{2,5})x(\d{2,5})", proc.stderr.decode("utf-8", "replace"))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def describe_quality(variant: Optional[dict], playlist: str, referer: str, ffmpeg: Optional[str]) -> str:
+    """Quality label of the stream that will be downloaded, e.g. '1080p (1920x960)'."""
+    if variant and variant.get("height"):
+        return quality_label(variant)
+    res = probe_resolution(playlist, referer, ffmpeg)
+    if res:
+        return quality_label({"width": res[0], "height": res[1]})
+    return quality_label(variant or {})
+
+
+def probe_qualities(movie_url: str, ep: dict, ffmpeg: Optional[str]) -> list[dict]:
     """Every quality of one episode with its estimated size, without downloading the movie.
     Each item: {"label", "size" (bytes or None), "duration" (seconds)}."""
     embed_url = ep["embed"]
-    with tempfile.TemporaryDirectory(prefix="nguonc-dl-") as td:
-        resolve_episode(movie_url, ep, td)
-    entries = [{"label": ep.get("quality") or t("source", "gốc"), "bandwidth": 0, "playlist": ep["playlist"]}]
+    text, url, source = open_episode(movie_url, embed_url)
+    variants = parse_variants(text, url)
+    streams = []
+    for v in variants or [None]:
+        media, media_url = media_of(source, v) if v else (text, url)
+        streams.append((v, clean_playlist(media, media_url)[0]))
 
-    # Master playlist (if any): measure each quality.
-    master_url = ep.get("master")
-    variants = parse_variants(http_get(master_url, referer=embed_url), master_url) if master_url else []
-    if variants:
-        entries = []
-        labels = [quality_label(v) for v in variants]
-        for v, label in zip(variants, labels):
-            if labels.count(label) > 1 and v["bandwidth"]:
-                # Two variants with the same resolution: tell them apart by bitrate.
-                label = f"{label} {v['bandwidth'] // 1000}k"
-            media, media_url, _ = fetch_media_playlist(v["url"], embed_url)
-            entries.append({"label": label, "bandwidth": v["bandwidth"],
-                            "playlist": clean_playlist(media, media_url)[0]})
-
-    for e in entries:
-        e["size"], e["duration"] = estimate_size(e.pop("playlist"), "", embed_url)
-        if e["size"] is None and e["bandwidth"] and e["duration"]:
-            e["size"] = e["bandwidth"] * e["duration"] / 8
+    labels = [describe_quality(v, pl, embed_url, ffmpeg) for v, pl in streams]
+    entries = []
+    for (v, pl), label in zip(streams, labels):
+        if labels.count(label) > 1 and v and v["bandwidth"]:
+            # Two variants with the same resolution: tell them apart by bitrate.
+            label = f"{label} {v['bandwidth'] // 1000}k"
+        size, duration = estimate_size(pl, embed_url)
+        if size is None and v and v["bandwidth"] and duration:
+            size = v["bandwidth"] * duration / 8
+        entries.append({"label": label, "size": size, "duration": duration})
     return entries
 
 
@@ -964,16 +1067,22 @@ def probe_qualities(movie_url: str, ep: dict) -> list[dict]:
 # File names, episode selection
 # --------------------------------------------------------------------------- #
 
+WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
 def safe_name(name: str) -> str:
     name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", name).strip().rstrip(". ")
+    if name.split(".")[0].upper() in WINDOWS_RESERVED:
+        name += "_"
     return name if name not in ("", ".", "..") else "nguonc"
 
 
-def build_filenames(title: str, episodes: list[dict]) -> list[str]:
-    """File names for every episode of a server, always unique."""
+def build_filenames(title: str, year: str, episodes: list[dict]) -> list[str]:
+    """File names for every episode of a server, always unique:
+    Movie.Name.2024.mp4 for a movie, Series.Name.S01E01.mp4 for a series."""
     base = re.sub(r"\s+", ".", safe_name(title))
     if len(episodes) == 1:
-        return [f"{base}.mp4"]
+        return [f"{base}.{year}.mp4" if year else f"{base}.mp4"]
 
     names, used = [], set()
     for ep in episodes:
@@ -992,11 +1101,13 @@ def build_filenames(title: str, episodes: list[dict]) -> list[str]:
     return names
 
 
-def episode_label(ep: dict, width: int) -> str:
-    name = str(ep.get("name") or "?")
-    if name.isdigit():
-        name = name.zfill(width)
-    return f"{t('Ep', 'Tập')} {name}"
+def episode_labels(episodes: list[dict]) -> list[str]:
+    """'Movie' for a single episode, else 'Ep 01', 'Ep 02', ... (numbers padded to the same width)."""
+    if len(episodes) == 1:
+        return [t("Movie", "Phim")]
+    names = [str(ep.get("name") or "?") for ep in episodes]
+    width = max((len(n) for n in names if n.isdigit()), default=1)
+    return [f"{t('Ep', 'Tập')} {n.zfill(width) if n.isdigit() else n}" for n in names]
 
 
 def parse_selection(text: str, count: int) -> list[int]:
@@ -1046,59 +1157,7 @@ def find_ffmpeg() -> Optional[str]:
         return None
 
 
-def remux_to_mp4(ffmpeg: str, src: str, dst: str) -> None:
-    """Turn MPEG-TS into a real MP4 (no re-encoding, very fast)."""
-    tmp = dst + ".part"
-    cmd = [
-        ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", src,
-        "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-movflags", "+faststart",
-    ]
-    err = ""
-    # aac_adtstoasc is needed for AAC audio in TS; retry without it if the audio is not AAC.
-    for extra in (["-bsf:a", "aac_adtstoasc"], []):
-        proc = subprocess.run(cmd + extra + ["-f", "mp4", tmp], capture_output=True)
-        if proc.returncode == 0:
-            os.replace(tmp, dst)
-            return
-        err = proc.stderr.decode("utf-8", "replace").strip()
-    try:
-        os.remove(tmp)
-    except OSError:
-        pass
-    raise RuntimeError(t("ffmpeg could not make the MP4", "ffmpeg không ghép được MP4") + f": {err[-300:]}")
-
-
-def _finish_ts(ts_path: str, out_path: str, label: str, ffmpeg: Optional[str]) -> str:
-    if not ffmpeg:
-        return ts_path
-    if board.enabled:
-        board.update(label, note=t("joining into MP4...", "đang ghép MP4..."))
-    else:
-        log(f"  {label}: " + t("joining into MP4...", "đang ghép MP4..."))
-    remux_to_mp4(ffmpeg, ts_path, out_path)
-    os.remove(ts_path)
-    return out_path
-
-
-def parse_segments(playlist: str, base_url: str = "") -> Optional[list[str]]:
-    """Segment URLs, or None when the playlist needs yt-dlp
-    (master playlist, AES-128 keys, byte ranges, init segment)."""
-    segments = []
-    for raw in playlist.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith("#"):
-            if line.startswith(("#EXT-X-STREAM-INF", "#EXT-X-MAP", "#EXT-X-BYTERANGE")):
-                return None
-            if line.startswith("#EXT-X-KEY") and "METHOD=NONE" not in line:
-                return None
-            continue
-        segments.append(urllib.parse.urljoin(base_url, line))
-    return segments or None
-
-
-# Running aria2c processes, so Ctrl+C stops them too.
+# Running aria2c / ffmpeg processes, so Ctrl+C stops them too.
 _children: set = set()
 
 
@@ -1110,118 +1169,198 @@ def kill_children() -> None:
             pass
 
 
-def download_aria2(
-    aria2: str, segments: list[str], out_path: str, referer: str, label: str,
-    ffmpeg: Optional[str], connections: int = 16, expected: Optional[float] = None,
-) -> str:
-    """Download the segments with aria2c, join them into a .ts, then make the MP4.
+def _remove(path) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
-    Unfinished segments live in a hidden .<name>.parts folder next to the target file,
-    so Ctrl+C and running the command again continues instead of starting over.
-    """
-    stem = os.path.splitext(out_path)[0]
-    parts_dir = os.path.join(os.path.dirname(out_path), f".{os.path.basename(stem)}.parts")
-    os.makedirs(parts_dir, exist_ok=True)
-    names = [f"{i:05d}.ts" for i in range(len(segments))]
 
-    def is_done(name: str) -> bool:
-        path = os.path.join(parts_dir, name)
-        return os.path.exists(path) and not os.path.exists(path + ".aria2")
+def make_mp4(ffmpeg: str, out_path: str, ts_file: Optional[str] = None, parts: Optional[list[Path]] = None) -> None:
+    """Join MPEG-TS into a real MP4 without re-encoding, from a .ts file or straight from the
+    segment files (piped into ffmpeg, so no big temporary .ts is written)."""
+    tmp = out_path + ".part"
+    err = ""
+    # aac_adtstoasc is needed for AAC audio in TS; retry without it if the audio is not AAC.
+    for extra in (["-bsf:a", "aac_adtstoasc"], []):
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "mpegts", "-i", ts_file or "pipe:0",
+               "-map", "0:v?", "-map", "0:a?", "-c", "copy", *extra, "-movflags", "+faststart", "-f", "mp4", tmp]
+        with tempfile.TemporaryFile() as err_file:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if parts else subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=err_file)
+            _children.add(proc)
+            try:
+                if parts:
+                    try:
+                        for part in parts:
+                            proc.stdin.write(ts_payload(part.read_bytes()))
+                    except OSError:
+                        pass   # ffmpeg stopped early; its error message says why
+                    finally:
+                        proc.stdin.close()
+                code = proc.wait()
+            finally:
+                _children.discard(proc)
+            err_file.seek(0)
+            err = err_file.read().decode("utf-8", "replace").strip()
+        if code == 0:
+            os.replace(tmp, out_path)
+            return
+    _remove(tmp)
+    raise RuntimeError(t("ffmpeg could not make the MP4", "ffmpeg không ghép được MP4") + f": {err[-300:]}")
 
-    pending = [(u, n) for u, n in zip(segments, names) if not is_done(n)]
-    log_path = os.path.join(parts_dir, "aria2.log")
-    if pending:
-        input_path = os.path.join(parts_dir, "input.txt")
-        with open(input_path, "w", encoding="utf-8") as fh:
-            for url, name in pending:
-                fh.write(f"{url}\n  out={name}\n")
-        cmd = [
-            aria2, "--no-conf",
-            f"--input-file={input_path}", f"--dir={parts_dir}",
-            # The CDN limits speed per connection: download many segments at once,
-            # and split each segment (~2 MB) over a few more connections.
-            f"--max-concurrent-downloads={connections}",
-            "--split=4", "--max-connection-per-server=4", "--min-split-size=1M",
-            f"--user-agent={USER_AGENT}", f"--referer={referer}",
-            "--http-accept-gzip=true",
-            "--continue=true", "--auto-file-renaming=false", "--allow-overwrite=true",
-            "--file-allocation=none", "--max-tries=10", "--retry-wait=2",
-            "--connect-timeout=15", "--timeout=30",
-            "--console-log-level=error", "--summary-interval=0",
-            "--download-result=hide", "--show-console-readout=false",
-            f"--log={log_path}", "--log-level=warn",
-        ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _children.add(proc)
 
-        samples: list[tuple[float, int]] = []
+def _note_joining(label: str) -> None:
+    if board.enabled:
+        board.update(label, note=t("joining into MP4...", "đang ghép MP4..."))
+    else:
+        log(f"  {label}: " + t("joining into MP4...", "đang ghép MP4..."))
+
+
+class Meter:
+    """Speed (5-second moving average), total and ETA of one episode, shown on the board."""
+
+    def __init__(self, label: str, count: int, expected: Optional[float]):
+        self.label, self.count, self.expected = label, count, expected
+        self.samples: list[tuple[float, int]] = []
+
+    def report(self, done_count: int, done_bytes: int, all_bytes: int) -> None:
+        now = time.monotonic()
+        self.samples = [s for s in self.samples if now - s[0] <= 5] + [(now, all_bytes)]
+        t0, b0 = self.samples[0]
+        speed = (all_bytes - b0) / (now - t0) if now - t0 >= 0.5 else None
+        # At the start a few segments are not enough to guess the total: use the earlier estimate.
+        if self.expected and done_count < max(5, self.count // 20):
+            total = max(self.expected, all_bytes)
+        else:
+            total = done_bytes / done_count * self.count if done_count else None
+        eta = (total - all_bytes) / speed if total and speed else None
+        board.update(self.label, pct=100.0 * done_count / self.count, done=all_bytes,
+                     total=total, speed=speed, eta=eta)
+
+
+# aria2c runs again for the segments that failed or came back broken, before giving up.
+ARIA2_PASSES = 3
+
+
+def _check_parts(parts_dir: Path, names: list[str], good: set[str]) -> None:
+    """Add the finished segments that really are video to `good`; delete broken ones
+    (empty files, error pages) so they are downloaded again."""
+    with os.scandir(parts_dir) as it:
+        listing = {e.name: e.stat().st_size for e in it}
+    for name in names:
+        if name in good or name not in listing or name + ".aria2" in listing:
+            continue
+        path = parts_dir / name
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(65536 + 3 * TS_PACKET)
+        except OSError:
+            continue
+        if listing[name] > 0 and ts_start(head) >= 0:
+            good.add(name)
+        else:
+            _remove(path)
+
+
+def _run_aria2(aria2: str, parts_dir: Path, pending: list[tuple[str, str]], referer: str,
+               connections: int, meter: Meter, names: set[str]) -> None:
+    input_path = parts_dir / "input.txt"
+    input_path.write_text("".join(f"{url}\n  out={name}\n" for url, name in pending), encoding="utf-8")
+    cmd = [
+        aria2, "--no-conf",
+        f"--input-file={input_path}", f"--dir={parts_dir}",
+        # The CDN limits speed per connection: download many segments at once,
+        # and split each segment (~2 MB) over a few more connections.
+        f"--max-concurrent-downloads={connections}",
+        "--split=4", "--max-connection-per-server=4", "--min-split-size=1M",
+        f"--user-agent={USER_AGENT}", f"--referer={referer}",
+        "--http-accept-gzip=true",
+        "--continue=true", "--auto-file-renaming=false", "--allow-overwrite=true",
+        "--file-allocation=none", "--max-tries=10", "--retry-wait=2",
+        "--connect-timeout=15", "--timeout=30",
+        "--console-log-level=error", "--summary-interval=0",
+        "--download-result=hide", "--show-console-readout=false",
+        f"--log={parts_dir / 'aria2.log'}", "--log-level=warn",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _children.add(proc)
+    try:
         while True:
             try:
                 proc.wait(timeout=0.5)
                 finished = True
             except subprocess.TimeoutExpired:
                 finished = False
-            except BaseException:
-                proc.terminate()
-                raise
-            finally:
-                if proc.poll() is not None:
-                    _children.discard(proc)
-            done_count, done_bytes, all_bytes = 0, 0, 0
             with os.scandir(parts_dir) as it:
-                for entry in it:
-                    if entry.name.endswith(".ts"):
-                        size = entry.stat().st_size
-                        all_bytes += size
-                        if is_done(entry.name):
-                            done_count += 1
-                            done_bytes += size
-            # Speed is a 5-second moving average, so speed and ETA do not jump around.
-            now = time.monotonic()
-            samples = [s for s in samples if now - s[0] <= 5] + [(now, all_bytes)]
-            t0, b0 = samples[0]
-            speed = (all_bytes - b0) / (now - t0) if now - t0 >= 0.5 else None
-            # At the start a few segments are not enough to guess the total: use the earlier estimate.
-            if expected and done_count < max(5, len(names) // 20):
-                total = max(expected, all_bytes)
-            else:
-                total = done_bytes / done_count * len(names) if done_count else None
-            eta = (total - all_bytes) / speed if total and speed else None
-            board.update(label, pct=100.0 * done_count / len(names), done=all_bytes,
-                         total=total, speed=speed, eta=eta)
+                listing = {e.name: e.stat().st_size for e in it}
+            done = [n for n in names if n in listing and n + ".aria2" not in listing]
+            meter.report(len(done), sum(listing[n] for n in done),
+                         sum(size for name, size in listing.items() if name in names))
             if finished:
-                break
+                return
+    except BaseException:
+        proc.terminate()
+        raise
+    finally:
+        _children.discard(proc)
 
-    missing = [n for n in names if not is_done(n)]
+
+def download_aria2(aria2: str, segments: list[str], out_path: str, referer: str, label: str,
+                   ffmpeg: Optional[str], connections: int = 16, expected: Optional[float] = None) -> str:
+    """Download the segments with aria2c, check them, then join them into the MP4.
+
+    Unfinished segments live in a hidden .<name>.parts folder next to the target file,
+    so Ctrl+C and running the command again continues instead of starting over.
+    """
+    stem = os.path.splitext(out_path)[0]
+    parts_dir = Path(out_path).parent / f".{os.path.basename(stem)}.parts"
+    parts_dir.mkdir(exist_ok=True)
+    names = [f"{i:05d}.ts" for i in range(len(segments))]
+    good: set[str] = set()
+    meter = Meter(label, len(names), expected)
+
+    for _ in range(ARIA2_PASSES):
+        _check_parts(parts_dir, names, good)
+        pending = [(u, n) for u, n in zip(segments, names) if n not in good]
+        if not pending:
+            break
+        _run_aria2(aria2, parts_dir, pending, referer, connections, meter, set(names))
+    _check_parts(parts_dir, names, good)
+
+    missing = len(names) - len(good)
     if missing:
         detail = ""
         try:
-            with open(log_path, encoding="utf-8", errors="replace") as fh:
+            with open(parts_dir / "aria2.log", encoding="utf-8", errors="replace") as fh:
                 errors = [l.strip() for l in fh if "ERROR" in l or "error" in l]
             if errors:
                 detail = f": {errors[-1][-200:]}"
         except OSError:
             pass
-        raise RuntimeError(t(f"aria2c is missing {len(missing)}/{len(names)} segments{detail} "
+        raise RuntimeError(t(f"{missing}/{len(names)} segments could not be downloaded{detail} "
                              "(run the same command again to continue)",
-                             f"aria2c còn thiếu {len(missing)}/{len(names)} đoạn{detail} "
+                             f"còn {missing}/{len(names)} đoạn chưa tải được{detail} "
                              "(chạy lại lệnh để tải tiếp)"))
 
-    # Plain concatenation of MPEG-TS segments is a valid stream.
-    ts_path = stem + ".ts"
-    with open(ts_path + ".part", "wb") as out:
-        for name in names:
-            with open(os.path.join(parts_dir, name), "rb") as fh:
-                shutil.copyfileobj(fh, out, 1024 * 1024)
-    os.replace(ts_path + ".part", ts_path)
+    parts = [parts_dir / n for n in names]
+    if ffmpeg:
+        _note_joining(label)
+        make_mp4(ffmpeg, out_path, parts=parts)
+        final = out_path
+    else:
+        # Plain concatenation of MPEG-TS segments is a valid stream.
+        final = stem + ".ts"
+        with open(final + ".part", "wb") as out:
+            for part in parts:
+                out.write(ts_payload(part.read_bytes()))
+        os.replace(final + ".part", final)
     shutil.rmtree(parts_dir, ignore_errors=True)
-    return _finish_ts(ts_path, out_path, label, ffmpeg)
+    return final
 
 
-def download_ytdlp(
-    src: str, out_path: str, referer: str, label: str, ffmpeg: Optional[str],
-    fragments: int = 8, expected: Optional[float] = None,
-) -> str:
+def download_ytdlp(src: str, out_path: str, referer: str, label: str, ffmpeg: Optional[str],
+                   fragments: int = 8, expected: Optional[float] = None) -> str:
     """Download one episode (src is the temporary .m3u8) with yt-dlp. Returns the final file path."""
     import yt_dlp
 
@@ -1263,7 +1402,12 @@ def download_ytdlp(
         failed = ydl.download([Path(src).resolve().as_uri()])
     if failed or not os.path.exists(ts_path):
         raise RuntimeError(t("yt-dlp reported an error", "yt-dlp báo lỗi khi tải"))
-    return _finish_ts(ts_path, out_path, label, ffmpeg)
+    if not ffmpeg:
+        return ts_path
+    _note_joining(label)
+    make_mp4(ffmpeg, out_path, ts_file=ts_path)
+    os.remove(ts_path)
+    return out_path
 
 
 # --------------------------------------------------------------------------- #
@@ -1277,7 +1421,9 @@ def run_parallel(fn, items: list, workers: int) -> None:
     cannot be interrupted, so Ctrl+C is ignored until everything is done. Waiting in short steps
     lets KeyboardInterrupt through.
     """
-    pool = ThreadPoolExecutor(max_workers=max(1, workers))
+    if not items:
+        return
+    pool = ThreadPoolExecutor(max_workers=max(1, min(workers, len(items))))
     futures = [pool.submit(fn, item) for item in items]
     try:
         while wait(futures, timeout=0.3).not_done:
@@ -1286,6 +1432,25 @@ def run_parallel(fn, items: list, workers: int) -> None:
         pool.shutdown(wait=False, cancel_futures=True)
     for fut in futures:
         fut.result()
+
+
+@dataclass
+class Job:
+    """One episode to download."""
+    label: str
+    ep: dict
+    out: str
+    src: str = ""                    # temporary .m3u8 (cleaned media playlist)
+    playlist: str = ""
+    quality: str = ""
+    ads_removed: int = 0
+    size: Optional[float] = None     # estimated bytes
+    duration: float = 0.0
+    status: str = ""                 # "", "ok", "skip" or "fail"
+    error: str = ""
+
+    def fail(self, error: str) -> None:
+        self.status, self.error = "fail", error
 
 
 def aria2_tip() -> str:
@@ -1297,8 +1462,13 @@ def aria2_tip() -> str:
              "(macOS: brew install aria2, Linux: sudo apt install aria2).")
 
 
-def show_sizes(url: str, episodes: list[dict], picked: list[int], sample_only: bool) -> int:
-    """Print the estimated size of every quality and exit, without downloading.
+def fmt_bitrate(size: Optional[float], duration: float) -> str:
+    return f"{size * 8 / duration / 1e6:.1f} Mbps" if size and duration else "?"
+
+
+def show_sizes(url: str, episodes: list[dict], labels: list[str], picked: list[int],
+               sample_only: bool, ffmpeg: Optional[str]) -> int:
+    """Print the quality, size and bitrate of every stream and exit, without downloading.
 
     For a series without -e only the first episode is measured and multiplied for the whole series,
     because every nguonc episode costs one link request (the server allows about 20 per hour).
@@ -1307,17 +1477,16 @@ def show_sizes(url: str, episodes: list[dict], picked: list[int], sample_only: b
     what = t("the first episode", "tập đầu") if len(probe_list) == 1 else t(f"{len(probe_list)} episodes",
                                                                             f"{len(probe_list)} tập")
     log("\n" + cyan(t(f"Measuring {what} (nothing is downloaded)...",
-                      f"Đang đo dung lượng {what} (không tải phim)...")))
+                      f"Đang đo {what} (không tải phim)...")))
     results: dict[int, list[dict]] = {}
 
     def probe(i):
         try:
-            results[i] = probe_qualities(url, episodes[i])
+            results[i] = probe_qualities(url, episodes[i], ffmpeg)
         except Exception as ex:
-            ep = episodes[i]
-            warn(f"{episode_label(ep, 1)}: {describe_error(ep.get('embed', ''), ex)}")
+            warn(f"{labels[i]}: {describe_error(episodes[i].get('embed', ''), ex)}")
 
-    run_parallel(probe, probe_list, min(4, len(probe_list)))
+    run_parallel(probe, probe_list, 3)
     if not results:
         return 1
 
@@ -1334,32 +1503,42 @@ def show_sizes(url: str, episodes: list[dict], picked: list[int], sample_only: b
                 tot["unknown"] += 1
 
     scale = len(picked) if sample_only and len(picked) > 1 else 1
-    h_quality, h_dur = t("Quality", "Chất lượng"), t("Length", "Thời lượng")
+    q_w = max(12, *(len(label) for label in totals)) + 2
+    h_size = t(f"Whole series ({len(picked)} eps)", f"Cả bộ ({len(picked)} tập)") if scale > 1 else t("Size", "Dung lượng")
+    s_w = max(14, len(h_size) + 2)
+    head = f"{t('Quality', 'Chất lượng'):<{q_w}}"
     if scale > 1:
-        head = (f"{h_quality:<12} {t('Per episode', 'Mỗi tập'):<14} "
-                f"{t(f'Whole series ({len(picked)} eps)', f'Cả bộ ({len(picked)} tập)'):<22} {h_dur}")
-    else:
-        head = f"{h_quality:<12} {t('Size', 'Dung lượng'):<14} {h_dur}"
+        head += f"{t('Per episode', 'Mỗi tập'):<14}"
+    head += f"{h_size:<{s_w}}{t('Bitrate', 'Bitrate'):<12}{t('Length', 'Thời lượng')}"
     log("\n  " + bold(head))
     log("  " + gray("─" * visible_len(head)))
-    for label, tot in totals.items():
-        per_ep = tot["size"] / max(1, tot["count"] - tot["unknown"]) if tot["size"] else 0
+    for n, (label, tot) in enumerate(totals.items()):
+        known = tot["count"] - tot["unknown"]
+        per_ep = tot["size"] / known if known and tot["size"] else 0
+        known_dur = tot["duration"] / tot["count"] if tot["count"] else 0
         total = per_ep * scale if scale > 1 else tot["size"]
         size_txt = f"~{fmt_bytes(total)}" if total else t("unknown", "không đo được")
+        row = f"{label:<{q_w}}"
         if scale > 1:
-            cols = f"{(f'~{fmt_bytes(per_ep)}' if per_ep else '?'):<14} {green(f'{size_txt:<22}')}"
+            row = bold(row) + f"{(f'~{fmt_bytes(per_ep)}' if per_ep else '?'):<14}"
         else:
-            cols = green(f"{size_txt:<14}")
-        dur = fmt_eta(tot["duration"] * scale) if tot["duration"] else "?"
-        note = yellow(t(f"  ({tot['unknown']} episodes unknown)", f"  (thiếu {tot['unknown']} tập)")) \
-            if tot["unknown"] and tot["size"] else ""
-        log(f"  {bold(f'{label:<12}')} {cols} {dur}{note}")
+            row = bold(row)
+        row += green(f"{size_txt:<{s_w}}") + f"{fmt_bitrate(per_ep, known_dur):<12}"
+        row += fmt_eta(tot["duration"] * scale) if tot["duration"] else "?"
+        if tot["unknown"] and tot["size"]:
+            row += yellow(t(f"  ({tot['unknown']} episodes unknown)", f"  (thiếu {tot['unknown']} tập)"))
+        if n == 0:
+            row += "  " + cyan(t("← downloaded by default", "← mặc định tải bản này"))
+        log("  " + row)
     if scale > 1:
         log(gray(t("\n  (Estimated from the first episode; use -e to measure specific episodes.)",
                    "\n  (Ước tính từ tập đầu; dùng -e để đo chính xác các tập cụ thể.)")))
     if len(totals) > 1:
-        log(gray(t("  Pick a quality with -q, for example: -q 720",
-                   "  Chọn chất lượng khi tải bằng -q, ví dụ: -q 720")))
+        log(gray(t("  Pick another quality with -q, for example: -q 720",
+                   "  Chọn chất lượng khác bằng -q, ví dụ: -q 720")))
+    else:
+        log(gray(t("  This is the only quality the site has for this movie.",
+                   "  Đây là chất lượng duy nhất trang có cho phim này.")))
     if not find_tool("aria2c"):
         log("\n" + yellow(aria2_tip()))
     return 0
@@ -1391,104 +1570,108 @@ def choose_server(servers: list[dict], args) -> Optional[dict]:
 
 
 def check_dependencies() -> bool:
-    try:
-        import yt_dlp  # noqa: F401
-        import cryptography  # noqa: F401
-    except ImportError as ex:
-        log(red(t(f"Missing library ({ex.name}). Run: python -m pip install -r requirements.txt",
-                  f"Thiếu thư viện ({ex.name}). Chạy: python -m pip install -r requirements.txt")), err=True)
+    missing = [name for name in ("yt_dlp", "cryptography") if importlib.util.find_spec(name) is None]
+    if missing:
+        log(red(t(f"Missing library ({', '.join(missing)}). Run: python -m pip install -r requirements.txt",
+                  f"Thiếu thư viện ({', '.join(missing)}). Chạy: python -m pip install -r requirements.txt")),
+            err=True)
         return False
     if not has_h2_client():
-        warn(t("No HTTP/2 (curl or httpx[http2]); Cloudflare may block the requests.",
-               "Không có HTTP/2 (curl hoặc httpx[http2]); có thể bị Cloudflare chặn."))
+        warn(t('No HTTP/2 (curl or httpx[http2]); Cloudflare may block the requests. '
+               'Run: python -m pip install "httpx[http2]"',
+               'Không có HTTP/2 (curl hoặc httpx[http2]); có thể bị Cloudflare chặn. '
+               'Chạy: python -m pip install "httpx[http2]"'))
     return True
 
 
-def resolve_jobs(url: str, todo: list[dict], tmp_dir: str, quality: Optional[str]) -> None:
-    """Get the playlist and estimate the size of every episode, in parallel."""
+def resolve_jobs(url: str, todo: list[Job], tmp_dir: str, quality: Optional[str], ffmpeg: Optional[str]) -> None:
+    """Get the stream, pick the quality and estimate the size of every episode, in parallel."""
     log("\n" + cyan(t(f"Getting links for {len(todo)} episode(s)...", f"Đang lấy link {len(todo)} tập...")))
 
-    def resolve(job):
-        ep = job["ep"]
+    def resolve(job: Job):
+        embed = job.ep["embed"]
         try:
-            job["src"] = resolve_episode(url, ep, tmp_dir, quality)
+            text, pl_url, source = open_episode(url, embed)
+            variants = parse_variants(text, pl_url)
+            chosen = pick_variant(variants, quality) if variants else None
+            media, media_url = media_of(source, chosen) if chosen else (text, pl_url)
+            job.playlist, job.ads_removed = clean_playlist(media, media_url)
         except Exception as ex:
-            job["status"] = "fail"
-            job["error"] = describe_error(ep.get("embed", ""), ex)
-            log(f"  {red('✗')} {job['label']}: {red(job['error'])}", err=True)
+            job.fail(describe_error(embed, ex))
+            log(f"  {red('✗')} {job.label}: {red(job.error)}", err=True)
             return
+        fd, job.src = tempfile.mkstemp(suffix=".m3u8", dir=tmp_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(job.playlist)
+        job.quality = describe_quality(chosen, job.playlist, embed, ffmpeg)
         try:
-            job["size"], duration = estimate_size(ep["playlist"], "", ep["embed"])
+            job.size, job.duration = estimate_size(job.playlist, embed)
         except Exception:
-            job["size"], duration = None, 0
+            job.size, job.duration = None, 0.0
         details = [
-            ep.get("quality"),
-            f"~{fmt_bytes(job['size'])}" if job["size"] else None,
-            fmt_eta(duration) if duration else None,
-            t(f"{ep['ads_removed']} ad segments removed", f"đã bỏ {ep['ads_removed']} đoạn quảng cáo")
-            if ep.get("ads_removed") else None,
+            bold(job.quality),
+            t("only quality", "chất lượng duy nhất") if not variants else
+            t(f"best of {len(variants)}", f"cao nhất trong {len(variants)} bản") if chosen is variants[0] else
+            t(f"{len(variants)} available", f"có {len(variants)} bản"),
+            f"~{fmt_bytes(job.size)}" if job.size else None,
+            fmt_bitrate(job.size, job.duration) if job.size else None,
+            fmt_eta(job.duration) if job.duration else None,
+            t(f"{job.ads_removed} ad segments removed", f"đã bỏ {job.ads_removed} đoạn quảng cáo")
+            if job.ads_removed else None,
         ]
-        log(f"  {gray('•')} {job['label']}: " + gray(" · ".join(d for d in details if d) or t("link ready", "đã lấy link")))
+        log(f"  {gray('•')} {job.label}: " + gray(" · ").join(d for d in details if d))
 
-    run_parallel(resolve, todo, min(4, len(todo)))
+    run_parallel(resolve, todo, 3)
 
 
-def download_jobs(ready: list[dict], aria2: Optional[str], ffmpeg: Optional[str],
+def download_jobs(ready: list[Job], aria2: Optional[str], ffmpeg: Optional[str],
                   jobs: int, fragments: int) -> None:
-    board.start([(j["label"], j.get("size")) for j in ready])
+    board.start([(j.label, j.size) for j in ready])
 
-    def download(job):
-        label, ep = job["label"], job["ep"]
+    def download(job: Job):
         if board.enabled:
-            board.update(label, note=t("starting...", "đang chuẩn bị..."))
+            board.update(job.label, note=t("starting...", "đang chuẩn bị..."))
         else:
-            log(f"> {label}: " + t("start", "bắt đầu") + f" -> {os.path.basename(job['out'])}")
+            log(f"> {job.label}: " + t("start", "bắt đầu") + f" -> {os.path.basename(job.out)}")
         try:
-            segments = parse_segments(ep["playlist"]) if aria2 else None
+            segments = parse_segments(job.playlist) if aria2 else None
             if aria2 and not segments:
-                log(gray(f"  {label}: " + t("special playlist, using yt-dlp", "playlist dạng đặc biệt, chuyển sang yt-dlp")))
+                log(gray(f"  {job.label}: " + t("special playlist, using yt-dlp",
+                                                 "playlist dạng đặc biệt, chuyển sang yt-dlp")))
             if segments:
-                final = download_aria2(aria2, segments, job["out"], ep["embed"], label, ffmpeg,
-                                       connections=fragments, expected=job.get("size"))
+                final = download_aria2(aria2, segments, job.out, job.ep["embed"], job.label, ffmpeg,
+                                       connections=fragments, expected=job.size)
             else:
-                final = download_ytdlp(job["src"], job["out"], ep["embed"], label, ffmpeg,
-                                       fragments=fragments, expected=job.get("size"))
+                final = download_ytdlp(job.src, job.out, job.ep["embed"], job.label, ffmpeg,
+                                       fragments=fragments, expected=job.size)
             size = os.path.getsize(final)
-            job["status"] = "ok"
-            board.finish(label, True, size)
-            log(f"  {bold_green('✓')} {bold(label)}  {green(os.path.basename(final))}  {gray(fmt_bytes(size))}")
+            job.status = "ok"
+            board.finish(job.label, True, size)
+            log(f"  {bold_green('✓')} {bold(job.label)}  {green(os.path.basename(final))}  {gray(fmt_bytes(size))}")
         except Exception as ex:
-            job["status"] = "fail"
-            job["error"] = str(ex)
-            board.finish(label, False)
-            log(f"  {bold_red('✗')} {bold(label)}  {red(str(ex))}", err=True)
+            job.fail(str(ex))
+            board.finish(job.label, False)
+            log(f"  {bold_red('✗')} {bold(job.label)}  {red(job.error)}", err=True)
 
     try:
-        run_parallel(download, ready, min(jobs, len(ready)))
+        run_parallel(download, ready, jobs)
     finally:
         board.stop()
 
 
-def write_failed(out_dir: Path, url: str, failed: list[dict]) -> Optional[Path]:
+def write_failed(out_dir: Path, url: str, failed: list[Job]) -> Optional[Path]:
     """failed.txt in the output folder: each failed episode with its link and reason.
     Removed again when nothing fails."""
     path = out_dir / "failed.txt"
     if not failed:
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        _remove(path)
         return None
     lines = [url, ""]
-    for j in failed:
-        lines.append(f"{j['label']}  {j['ep'].get('embed', '')}")
-        lines.append(f"    {j.get('error', '')}")
+    for job in failed:
+        lines.append(f"{job.label}  {job.ep.get('embed', '')}")
+        lines.append(f"    {job.error}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
-
-
-def default_output_dir() -> Path:
-    return SCRIPT_DIR / "downloads"
 
 
 def run(args) -> int:
@@ -1504,8 +1687,8 @@ def run(args) -> int:
         log(red(t("Error: ", "Lỗi: ") + describe_error(url, ex)), err=True)
         return 1
 
-    title = info["english_title"]
-    log("\n  " + bold(title) + (gray(f" ({info['year']})") if info["year"] else ""))
+    title, year = info["english_title"], info["year"]
+    log("\n  " + bold(title) + (gray(f" ({year})") if year else ""))
     servers = info["servers"]
     if not servers:
         log(red(t("This movie has no servers.", "Phim này không có server nào.")), err=True)
@@ -1540,15 +1723,16 @@ def run(args) -> int:
 
     if not check_dependencies():
         return 1
-    if args.info:
-        return show_sizes(url, episodes, picked, sample_only=not args.eps)
-
     ffmpeg = find_ffmpeg()
+    labels = episode_labels(episodes)
+    if args.info:
+        return show_sizes(url, episodes, labels, picked, not args.eps, ffmpeg)
+
     if not ffmpeg:
         warn(t("ffmpeg not found, files will be saved as .ts "
-               "(put ffmpeg.exe next to nguonc-dl.py or run `pip install imageio-ffmpeg`).",
+               "(put ffmpeg.exe next to nguonc-dl.py or run `python -m pip install imageio-ffmpeg`).",
                "Không tìm thấy ffmpeg, file sẽ được lưu dạng .ts "
-               "(đặt ffmpeg.exe cạnh nguonc-dl.py hoặc chạy `pip install imageio-ffmpeg`)."))
+               "(đặt ffmpeg.exe cạnh nguonc-dl.py hoặc chạy `python -m pip install imageio-ffmpeg`)."))
     aria2 = find_tool("aria2c") if args.downloader in ("auto", "aria2") else None
     if args.downloader == "aria2" and not aria2:
         log(red(t("aria2c not found: put aria2c.exe next to nguonc-dl.py or install it on PATH.",
@@ -1559,9 +1743,9 @@ def run(args) -> int:
     if not aria2 and args.downloader == "auto":
         log(yellow(aria2_tip()))
 
-    out_dir = Path(args.output).expanduser() if args.output else default_output_dir()
+    out_dir = Path(args.output).expanduser() if args.output else SCRIPT_DIR / "downloads"
     if not args.no_subfolder:
-        out_dir = out_dir / safe_name(title)
+        out_dir = out_dir / safe_name(f"{title} ({year})" if year else title)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     jobs = max(1, min(args.jobs, 8, len(picked)))
@@ -1570,40 +1754,32 @@ def run(args) -> int:
     else:
         fragments = max(1, min(args.fragments, 64 if aria2 else 32))
 
-    filenames = build_filenames(title, episodes)
-    num_w = max((len(str(ep.get("name"))) for ep in episodes if str(ep.get("name", "")).isdigit()), default=1)
-    jobs_list = [
-        {"label": episode_label(episodes[i], num_w), "ep": episodes[i], "out": str(out_dir / filenames[i])}
-        for i in picked
-    ]
+    filenames = build_filenames(title, year, episodes)
+    all_jobs = [Job(labels[i], episodes[i], str(out_dir / filenames[i])) for i in picked]
 
     todo = []
-    for job in jobs_list:
-        done_files = [job["out"]]
-        if not ffmpeg:
-            done_files.append(os.path.splitext(job["out"])[0] + ".ts")
+    for job in all_jobs:
+        done_files = [job.out] + ([] if ffmpeg else [os.path.splitext(job.out)[0] + ".ts"])
         existing = next((f for f in done_files if os.path.exists(f) and os.path.getsize(f) > 0), None)
         if existing:
-            log(f"  {gray('=')} {job['label']}: " + gray(t("already there, skipped", "đã có, bỏ qua")
-                                                         + f" ({os.path.basename(existing)})"))
-            job["status"] = "skip"
+            log(f"  {gray('=')} {job.label}: " + gray(t("already there, skipped", "đã có, bỏ qua")
+                                                      + f" ({os.path.basename(existing)})"))
+            job.status = "skip"
         else:
             todo.append(job)
 
     tmp_dir = tempfile.mkdtemp(prefix="nguonc-dl-")
     try:
-        if todo:
-            resolve_jobs(url, todo, tmp_dir, args.quality)
-
-        ready = [j for j in todo if j.get("src")]
-        total_size = sum(j.get("size") or 0 for j in ready)
+        resolve_jobs(url, todo, tmp_dir, args.quality, ffmpeg)
+        ready = [j for j in todo if j.src]
+        total_size = sum(j.size or 0 for j in ready)
         if total_size:
-            unknown = sum(1 for j in ready if not j.get("size"))
+            unknown = sum(1 for j in ready if not j.size)
             log("\n" + t("Estimated size: ", "Dung lượng ước tính: ") + bold(f"~{fmt_bytes(total_size)}")
                 + (gray(t(f" ({unknown} episodes unknown)", f" (chưa tính {unknown} tập không đo được)"))
                    if unknown else ""))
             free = shutil.disk_usage(out_dir).free
-            if free < total_size:
+            if free < total_size * 1.05:
                 warn(t(f"Only {fmt_bytes(free)} free on this drive, it may not be enough.",
                        f"Ổ đĩa chỉ còn trống {fmt_bytes(free)}, có thể không đủ chỗ."))
         if ready:
@@ -1614,10 +1790,10 @@ def run(args) -> int:
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    ok = sum(1 for j in jobs_list if j.get("status") in ("ok", "skip"))
-    failed = [j for j in jobs_list if j.get("status") == "fail"]
+    ok = sum(1 for j in all_jobs if j.status in ("ok", "skip"))
+    failed = [j for j in all_jobs if j.status == "fail"]
     failed_file = write_failed(out_dir, url, failed)
-    done_txt = t(f"Done: {ok}/{len(jobs_list)} episode(s).", f"Hoàn tất: {ok}/{len(jobs_list)} tập.")
+    done_txt = t(f"Done: {ok}/{len(all_jobs)} episode(s).", f"Hoàn tất: {ok}/{len(all_jobs)} tập.")
     log("\n" + (bold_green(done_txt) if not failed else bold_red(done_txt)) + " " + gray(str(out_dir)))
     if failed_file:
         log(yellow(t(f"Failed episodes and reasons: {failed_file}", f"Tập lỗi và lý do: {failed_file}")))

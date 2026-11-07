@@ -9,9 +9,10 @@
 Download movies and series from **phim.nguonc.com** as **MP4** files.
 
 - Paste a link: a movie downloads as one file, a series downloads **every episode**
-- See the **size of each quality** before downloading (`--info`)
+- Always downloads the **highest quality** the site has (the real resolution is checked, e.g. `1080p (1920x960)`)
+- See the **quality, size and bitrate** before downloading (`--info`)
 - Fast downloads with **aria2c** (falls back to yt-dlp)
-- Removes the **ad segments** spliced into the movie
+- Removes the **ad segments** spliced into the movie, and downloads broken segments again
 - Live progress bars: one per episode plus a total, with speed and ETA
 - Stop anytime, run the same command again to continue
 
@@ -39,25 +40,29 @@ python nguonc-dl.py "https://phim.nguonc.com/phim/movie-name"
 |---|---|
 | `python nguonc-dl.py <link>` | Download the movie, or every episode of a series |
 | `python nguonc-dl.py movie-name` | The name from the link works too |
-| `python nguonc-dl.py <link> --info` | Only show the size of each quality |
+| `python nguonc-dl.py <link> --info` | Only show the quality, size and bitrate |
 | `python nguonc-dl.py <link> -e 1-5,8` | Only episodes 1 to 5 and 8 (`10-` = from 10 to the end) |
-| `python nguonc-dl.py <link> -q 720` | Pick a quality (`best`, `worst`, `1080`, `720`, ...) |
+| `python nguonc-dl.py <link> -q 720` | Pick a lower quality, when the movie has several (`best`, `worst`, `1080`, `720`, ...) |
 | `python nguonc-dl.py <link> -s 2` | Use server 2 (e.g. dubbed instead of subtitled) |
 | `python nguonc-dl.py <link> --list` | Only list the servers and episodes |
 | `python nguonc-dl.py <link> -o D:\Movies` | Save to another folder |
 | `python nguonc-dl.py <link> -j 3` | Download 3 episodes at a time (default 2) |
 | `python nguonc-dl.py <link> --lang vi` | Show messages in Vietnamese |
 
-Files are saved in `downloads/<movie title>/`, named like `Movie.Name.S01E01.mp4`.
+Files are saved in `downloads/<title> (<year>)/`, named like `Movie.Name.2024.mp4` for a movie
+and `Series.Name.S01E01.mp4` for a series.
 
-Check the size before downloading:
+Check before downloading:
 
 ```
-  Quality      Per episode    Whole series (16 eps)  Length
-  ──────────────────────────────────────────────────────────
-  1080p        ~640.2 MB      ~10.0 GB               11:03:28
-  720p         ~312.5 MB      ~4.9 GB                11:03:28
+  Quality           Size          Bitrate     Length
+  ──────────────────────────────────────────────────
+  1080p (1920x960)  ~1.7 GB       2.1 Mbps    1:56:53  ← downloaded by default
+  This is the only quality the site has for this movie.
 ```
+
+The highest quality is picked by default. Most movies on the site have a single quality
+(usually 1080p); when there are several, all of them are listed and `-q` picks another one.
 
 While downloading:
 
@@ -84,8 +89,8 @@ nothing fails.
 
 - **`python` is not recognized:** reinstall Python and tick **Add python.exe to PATH**
 - **"Missing library":** run `python -m pip install -r requirements.txt` again
-- **"rate limited by the server":** the site allows about 20 links per hour. Wait a while and run the
-  same command again, or download fewer episodes at once with `-e`
+- **"rate limited by the server":** the site allows about 20 links per hour. Short waits are done
+  automatically; for longer ones, wait a while and run the same command again (or use `-e` for fewer episodes)
 - **"HTTP/2 is needed" / HTTP 403:** run `python -m pip install "httpx[http2]"`
 - **Slow downloads:** put `aria2c.exe` next to `nguonc-dl.py`
 - **Ctrl+C:** stops right away. Run the same command again to continue

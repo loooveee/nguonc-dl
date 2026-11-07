@@ -9,9 +9,10 @@
 Tải phim lẻ và phim bộ từ **phim.nguonc.com** về máy dưới dạng file **MP4**.
 
 - Dán link là tải: phim lẻ ra một file, phim bộ tải **toàn bộ các tập**
-- Xem **dung lượng từng chất lượng** trước khi tải (`--info`)
+- Luôn tải **chất lượng cao nhất** mà trang có (kiểm tra độ phân giải thật, vd `1080p (1920x960)`)
+- Xem **chất lượng, dung lượng và bitrate** trước khi tải (`--info`)
 - Tải nhanh bằng **aria2c** (không có thì dùng yt-dlp)
-- Tự bỏ **đoạn quảng cáo** chèn giữa phim
+- Tự bỏ **đoạn quảng cáo** chèn giữa phim, đoạn nào tải hỏng thì tự tải lại
 - Thanh tiến độ trực tiếp: mỗi tập một thanh, thêm một dòng tổng, có tốc độ và thời gian còn lại
 - Tắt giữa chừng thì chạy lại đúng lệnh cũ để tải tiếp
 
@@ -39,16 +40,38 @@ python nguonc-dl.py "https://phim.nguonc.com/phim/ten-phim"
 |---|---|
 | `python nguonc-dl.py <link>` | Tải phim lẻ, hoặc toàn bộ tập của phim bộ |
 | `python nguonc-dl.py ten-phim` | Chỉ cần phần tên trong link cũng được |
-| `python nguonc-dl.py <link> --info` | Chỉ xem dung lượng từng chất lượng |
+| `python nguonc-dl.py <link> --info` | Chỉ xem chất lượng, dung lượng và bitrate |
 | `python nguonc-dl.py <link> -e 1-5,8` | Chỉ tải tập 1 đến 5 và tập 8 (`10-` = từ tập 10 tới hết) |
-| `python nguonc-dl.py <link> -q 720` | Chọn chất lượng (`best`, `worst`, `1080`, `720`, ...) |
+| `python nguonc-dl.py <link> -q 720` | Chọn bản thấp hơn, khi phim có nhiều chất lượng (`best`, `worst`, `1080`, `720`, ...) |
 | `python nguonc-dl.py <link> -s 2` | Dùng server 2 (vd thuyết minh thay vì vietsub) |
 | `python nguonc-dl.py <link> --list` | Chỉ liệt kê server và tập |
 | `python nguonc-dl.py <link> -o D:\Phim` | Lưu vào thư mục khác |
 | `python nguonc-dl.py <link> -j 3` | Tải 3 tập cùng lúc (mặc định 2) |
 | `python nguonc-dl.py <link> --lang vi` | Hiện thông báo bằng tiếng Việt |
 
-File được lưu trong `downloads/<tên phim>/`, đặt tên kiểu `Ten.Phim.S01E01.mp4`.
+File được lưu trong `downloads/<tên phim> (<năm>)/`, đặt tên kiểu `Ten.Phim.2024.mp4` với phim lẻ
+và `Ten.Phim.S01E01.mp4` với phim bộ.
+
+Xem trước khi tải:
+
+```
+  Chất lượng         Dung lượng    Bitrate     Thời lượng
+  ───────────────────────────────────────────────────────
+  1080p (1920x960)   ~1.7 GB       2.1 Mbps    1:56:53  ← mặc định tải bản này
+  Đây là chất lượng duy nhất trang có cho phim này.
+```
+
+Mặc định luôn chọn chất lượng cao nhất. Đa số phim trên trang chỉ có một chất lượng (thường là 1080p);
+phim nào có nhiều bản thì đều được liệt kê, dùng `-q` để chọn bản khác.
+
+Khi đang tải:
+
+```
+  ⠹ Tập 01      ━━━━━━━━━━━━━━━━━╸━━━━━━━━━━━━    58.3%    392.9 MB / 673.3 MB     17.4 MB/s   ETA   00:16
+  ⠼ Tập 02      ━━━━━━╸━━━━━━━━━━━━━━━━━━━━━━━    21.0%    141.1 MB / 674.2 MB     17.1 MB/s   ETA   00:31
+  ───────────────────────────────────────────────────────────────────────────────────────────────────────
+  Σ Tổng 1/4    ━━━━━━━━━━━━━╸━━━━━━━━━━━━━━━━    44.8%      1.2 GB / 2.7 GB       34.4 MB/s   ETA   00:44
+```
 
 Thông báo mặc định bằng **tiếng Anh**, máy cài tiếng Việt thì tự chuyển sang tiếng Việt.
 Dùng `--lang vi` hoặc `--lang en` để tự chọn. Dùng `--no-color` (hoặc đặt biến `NO_COLOR=1`) để in chữ trơn.
@@ -65,8 +88,8 @@ link và lý do). Chạy lại đúng lệnh cũ để thử lại: tập đã x
 
 - **`python` is not recognized:** cài lại Python và tích ô **Add python.exe to PATH**
 - **"Thiếu thư viện":** chạy lại `python -m pip install -r requirements.txt`
-- **"bị máy chủ giới hạn lượt":** trang chỉ cho khoảng 20 link mỗi giờ. Đợi một lúc rồi chạy lại đúng
-  lệnh cũ, hoặc tải ít tập hơn mỗi lần bằng `-e`
+- **"bị máy chủ giới hạn lượt":** trang chỉ cho khoảng 20 link mỗi giờ. Chờ ngắn thì tool tự đợi rồi thử lại;
+  chờ lâu thì đợi một lúc rồi chạy lại đúng lệnh cũ (hoặc tải ít tập hơn bằng `-e`)
 - **"Cần HTTP/2" / HTTP 403:** chạy `python -m pip install "httpx[http2]"`
 - **Tải chậm:** đặt `aria2c.exe` cạnh `nguonc-dl.py`
 - **Ctrl+C:** dừng ngay. Chạy lại đúng lệnh cũ để tải tiếp
