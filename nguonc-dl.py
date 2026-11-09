@@ -883,7 +883,7 @@ def clean_playlist(text: str, base_url: str) -> tuple[str, int]:
 
     out, pending, removed = [], [], 0
     for line in lines:
-        if line.startswith("#EXT-X-KEY"):
+        if line.startswith(("#EXT-X-KEY", "#EXT-X-MAP")):
             line = re.sub(r'URI="([^"]+)"',
                           lambda m: f'URI="{urllib.parse.urljoin(base_url, m.group(1))}"', line)
         if line.startswith("#EXT-X-DISCONTINUITY") and drop_ads:
@@ -1159,10 +1159,26 @@ def find_ffmpeg() -> Optional[str]:
 
 # Running aria2c / ffmpeg processes, so Ctrl+C stops them too.
 _children: set = set()
+_children_lock = threading.Lock()
+_stopping = threading.Event()
+
+
+def spawn(cmd: list, **kwargs) -> subprocess.Popen:
+    """Start a child process that kill_children() can stop. After Ctrl+C no new one is started
+    (a download thread would otherwise start the next aria2c pass / ffmpeg retry and leave it running)."""
+    with _children_lock:
+        if _stopping.is_set():
+            raise KeyboardInterrupt
+        proc = subprocess.Popen(cmd, **kwargs)
+        _children.add(proc)
+    return proc
 
 
 def kill_children() -> None:
-    for proc in list(_children):
+    with _children_lock:
+        _stopping.set()
+        procs = list(_children)
+    for proc in procs:
         try:
             proc.terminate()
         except Exception:
@@ -1186,9 +1202,8 @@ def make_mp4(ffmpeg: str, out_path: str, ts_file: Optional[str] = None, parts: O
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "mpegts", "-i", ts_file or "pipe:0",
                "-map", "0:v?", "-map", "0:a?", "-c", "copy", *extra, "-movflags", "+faststart", "-f", "mp4", tmp]
         with tempfile.TemporaryFile() as err_file:
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if parts else subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=err_file)
-            _children.add(proc)
+            proc = spawn(cmd, stdin=subprocess.PIPE if parts else subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=err_file)
             try:
                 if parts:
                     try:
@@ -1197,7 +1212,10 @@ def make_mp4(ffmpeg: str, out_path: str, ts_file: Optional[str] = None, parts: O
                     except OSError:
                         pass   # ffmpeg stopped early; its error message says why
                     finally:
-                        proc.stdin.close()
+                        try:
+                            proc.stdin.close()   # flushes the buffer: fails again if ffmpeg is gone
+                        except OSError:
+                            pass
                 code = proc.wait()
             finally:
                 _children.discard(proc)
@@ -1243,11 +1261,23 @@ class Meter:
 ARIA2_PASSES = 3
 
 
+def _file_sizes(folder: Path) -> dict[str, int]:
+    """name -> size of the files in a folder. aria2c creates and deletes files (.aria2 control
+    files) while it runs, so a file can vanish between listing it and reading its size."""
+    sizes = {}
+    with os.scandir(folder) as it:
+        for entry in it:
+            try:
+                sizes[entry.name] = entry.stat().st_size
+            except OSError:
+                pass
+    return sizes
+
+
 def _check_parts(parts_dir: Path, names: list[str], good: set[str]) -> None:
     """Add the finished segments that really are video to `good`; delete broken ones
     (empty files, error pages) so they are downloaded again."""
-    with os.scandir(parts_dir) as it:
-        listing = {e.name: e.stat().st_size for e in it}
+    listing = _file_sizes(parts_dir)
     for name in names:
         if name in good or name not in listing or name + ".aria2" in listing:
             continue
@@ -1283,8 +1313,7 @@ def _run_aria2(aria2: str, parts_dir: Path, pending: list[tuple[str, str]], refe
         "--download-result=hide", "--show-console-readout=false",
         f"--log={parts_dir / 'aria2.log'}", "--log-level=warn",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    _children.add(proc)
+    proc = spawn(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         while True:
             try:
@@ -1292,9 +1321,8 @@ def _run_aria2(aria2: str, parts_dir: Path, pending: list[tuple[str, str]], refe
                 finished = True
             except subprocess.TimeoutExpired:
                 finished = False
-            with os.scandir(parts_dir) as it:
-                listing = {e.name: e.stat().st_size for e in it}
-            done = [n for n in names if n in listing and n + ".aria2" not in listing]
+            listing = _file_sizes(parts_dir)
+            done =[n for n in names if n in listing and n + ".aria2" not in listing]
             meter.report(len(done), sum(listing[n] for n in done),
                          sum(size for name, size in listing.items() if name in names))
             if finished:
