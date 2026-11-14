@@ -552,9 +552,11 @@ def _year_from_api(slug: str) -> str:
         data = json.loads(http_get(f"{SITE}/api/film/{slug}"))
         for cat in data.get("movie", {}).get("category", {}).values():
             if cat.get("group", {}).get("name") == "Năm":
-                years = [x["name"] for x in cat.get("list", [])]
-                if years:
-                    return years[0]
+                # Only a real year: it becomes part of the file and folder names.
+                for x in cat.get("list", []):
+                    m = re.search(r"\b(?:19|20)\d{2}\b", str(x.get("name", "")))
+                    if m:
+                        return m.group()
     except Exception:
         pass
     return ""
@@ -701,7 +703,8 @@ class Source:
             text = http_get(url, referer=self.embed_url)
         if "#ENC-AESGCM" in text:
             text = _decrypt_m3u8(text, self.video_hash)
-        return text
+        # A byte order mark would make "#EXTM3U" look like a segment address.
+        return text.lstrip("\ufeff")
 
 
 def _bootstrap_playlist(movie_url: str, embed_url: str) -> tuple[str, str, Source]:
@@ -873,9 +876,13 @@ def clean_playlist(text: str, base_url: str) -> tuple[str, int]:
     seg_urls = [urllib.parse.urljoin(base_url, l) for l in lines if not l.startswith("#")]
     if not seg_urls:
         return text, 0
+    def folder(u: str) -> str:
+        # Without the query string: a "/" in a token must not look like another folder.
+        return u.split("?", 1)[0].rsplit("/", 1)[0]
+
     dirs: dict[str, int] = {}
     for u in seg_urls:
-        d = u.rsplit("/", 1)[0]
+        d = folder(u)
         dirs[d] = dirs.get(d, 0) + 1
     main_dir = max(dirs, key=dirs.get)
     minority = len(seg_urls) - dirs[main_dir]
@@ -895,7 +902,7 @@ def clean_playlist(text: str, base_url: str) -> tuple[str, int]:
             out.append(line)
             continue
         url = urllib.parse.urljoin(base_url, line)
-        if drop_ads and url.rsplit("/", 1)[0] != main_dir:
+        if drop_ads and folder(url) != main_dir:
             removed += 1
         else:
             out.extend(pending)
@@ -1070,17 +1077,27 @@ def probe_qualities(movie_url: str, ep: dict, ffmpeg: Optional[str]) -> list[dic
 WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
+MAX_NAME = 120   # keeps the folder + file name + ".parts/00000.ts.aria2" under the Windows path limit
+
+
 def safe_name(name: str) -> str:
-    name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", name).strip().rstrip(". ")
-    if name.split(".")[0].upper() in WINDOWS_RESERVED:
-        name += "_"
+    name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", name).strip()[:MAX_NAME].rstrip(". ")
+    # Windows reads "CON.anything" as the device CON: the part before the first dot must change.
+    head, dot, rest = name.partition(".")
+    if head.strip().upper() in WINDOWS_RESERVED:
+        name = f"{head.strip()}_{dot}{rest}"
     return name if name not in ("", ".", "..") else "nguonc"
+
+
+def dotted_name(name: str) -> str:
+    """'Con Air' -> 'Con_.Air': a safe name with dots instead of spaces."""
+    return safe_name(re.sub(r"\s+", ".", safe_name(name)))
 
 
 def build_filenames(title: str, year: str, episodes: list[dict]) -> list[str]:
     """File names for every episode of a server, always unique:
     Movie.Name.2024.mp4 for a movie, Series.Name.S01E01.mp4 for a series."""
-    base = re.sub(r"\s+", ".", safe_name(title))
+    base = dotted_name(title)
     if len(episodes) == 1:
         return [f"{base}.{year}.mp4" if year else f"{base}.mp4"]
 
@@ -1091,7 +1108,8 @@ def build_filenames(title: str, year: str, episodes: list[dict]) -> list[str]:
         if num:
             stem = f"{base}.S01E{int(num.group()):02d}"
         else:
-            stem = f"{base}.{re.sub(r'[\s]+', '.', safe_name(label))}"
+            # (no backslash inside an f-string expression: that is a syntax error before Python 3.12)
+            stem = base + "." + dotted_name(label)
         candidate, n = stem, 2
         while candidate.lower() in used:
             candidate = f"{stem}.{n}"
@@ -1198,8 +1216,13 @@ def make_mp4(ffmpeg: str, out_path: str, ts_file: Optional[str] = None, parts: O
     tmp = out_path + ".part"
     err = ""
     # aac_adtstoasc is needed for AAC audio in TS; retry without it if the audio is not AAC.
-    for extra in (["-bsf:a", "aac_adtstoasc"], []):
-        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "mpegts", "-i", ts_file or "pipe:0",
+    attempts = [(["-f", "mpegts"], ["-bsf:a", "aac_adtstoasc"]), (["-f", "mpegts"], [])]
+    if ts_file:
+        # A file from yt-dlp is not always MPEG-TS (playlists with an init segment are fragmented
+        # MP4): as a last try let ffmpeg find the format itself.
+        attempts.append(([], []))
+    for fmt, extra in attempts:
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *fmt, "-i", ts_file or "pipe:0",
                "-map", "0:v?", "-map", "0:a?", "-c", "copy", *extra, "-movflags", "+faststart", "-f", "mp4", tmp]
         with tempfile.TemporaryFile() as err_file:
             proc = spawn(cmd, stdin=subprocess.PIPE if parts else subprocess.DEVNULL,
@@ -1217,6 +1240,11 @@ def make_mp4(ffmpeg: str, out_path: str, ts_file: Optional[str] = None, parts: O
                         except OSError:
                             pass
                 code = proc.wait()
+            except BaseException:
+                proc.kill()   # e.g. a segment that is not video: do not leave ffmpeg and its .part behind
+                proc.wait()
+                _remove(tmp)
+                raise
             finally:
                 _children.discard(proc)
             err_file.seek(0)
@@ -1335,16 +1363,32 @@ def _run_aria2(aria2: str, parts_dir: Path, pending: list[tuple[str, str]], refe
 
 
 def download_aria2(aria2: str, segments: list[str], out_path: str, referer: str, label: str,
-                   ffmpeg: Optional[str], connections: int = 16, expected: Optional[float] = None) -> str:
+                   ffmpeg: Optional[str], connections: int = 16, expected: Optional[float] = None,
+                   tag: str = "") -> str:
     """Download the segments with aria2c, check them, then join them into the MP4.
 
     Unfinished segments live in a hidden .<name>.parts folder next to the target file,
     so Ctrl+C and running the command again continues instead of starting over.
+    `tag` names the stream (quality): segments kept from another stream are thrown away.
     """
     stem = os.path.splitext(out_path)[0]
     parts_dir = Path(out_path).parent / f".{os.path.basename(stem)}.parts"
     parts_dir.mkdir(exist_ok=True)
     names = [f"{i:05d}.ts" for i in range(len(segments))]
+
+    # Segment files are only numbered, so segments left by a run with another -q (or another
+    # number of segments) would be joined into this movie. Start over when the stream changed.
+    stamp_path = parts_dir / "stream.txt"
+    stamp = f"{len(segments)} {tag}".strip()
+    try:
+        old_stamp = stamp_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        old_stamp = None   # folder from an older version: keep its segments
+    if old_stamp is not None and old_stamp != stamp:
+        shutil.rmtree(parts_dir, ignore_errors=True)
+        parts_dir.mkdir(exist_ok=True)
+    stamp_path.write_text(stamp + "\n", encoding="utf-8")
+
     good: set[str] = set()
     meter = Meter(label, len(names), expected)
 
@@ -1471,6 +1515,7 @@ class Job:
     src: str = ""                    # temporary .m3u8 (cleaned media playlist)
     playlist: str = ""
     quality: str = ""
+    stream: str = ""                 # which quality of the master playlist (kept with unfinished segments)
     ads_removed: int = 0
     size: Optional[float] = None     # estimated bytes
     duration: float = 0.0
@@ -1624,6 +1669,8 @@ def resolve_jobs(url: str, todo: list[Job], tmp_dir: str, quality: Optional[str]
             chosen = pick_variant(variants, quality) if variants else None
             media, media_url = media_of(source, chosen) if chosen else (text, pl_url)
             job.playlist, job.ads_removed = clean_playlist(media, media_url)
+            if chosen:
+                job.stream = f"{chosen['width']}x{chosen['height']} {chosen['bandwidth']}"
         except Exception as ex:
             job.fail(describe_error(embed, ex))
             log(f"  {red('✗')} {job.label}: {red(job.error)}", err=True)
@@ -1668,7 +1715,7 @@ def download_jobs(ready: list[Job], aria2: Optional[str], ffmpeg: Optional[str],
                                                  "playlist dạng đặc biệt, chuyển sang yt-dlp")))
             if segments:
                 final = download_aria2(aria2, segments, job.out, job.ep["embed"], job.label, ffmpeg,
-                                       connections=fragments, expected=job.size)
+                                       connections=fragments, expected=job.size, tag=job.stream)
             else:
                 final = download_ytdlp(job.src, job.out, job.ep["embed"], job.label, ffmpeg,
                                        fragments=fragments, expected=job.size)
@@ -1705,7 +1752,8 @@ def write_failed(out_dir: Path, url: str, failed: list[Job]) -> Optional[Path]:
 def run(args) -> int:
     url = args.url.strip().rstrip("/")
     if not url.startswith(("http://", "https://")):
-        url = f"{SITE}/phim/{url}"
+        # "movie-name", or a link pasted without https:// (phim.nguonc.com/phim/movie-name)
+        url = f"https://{url}" if "/" in url else f"{SITE}/phim/{url}"
 
     log(bold_cyan("nguonc-dl") + gray(f" v{__version__}"))
     log(gray(t("Reading movie page: ", "Đang đọc trang phim: ") + url))
@@ -1774,7 +1822,12 @@ def run(args) -> int:
     out_dir = Path(args.output).expanduser() if args.output else SCRIPT_DIR / "downloads"
     if not args.no_subfolder:
         out_dir = out_dir / safe_name(f"{title} ({year})" if year else title)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as ex:
+        log(red(t(f"Cannot create the output folder {out_dir}: {ex}",
+                  f"Không tạo được thư mục lưu {out_dir}: {ex}")), err=True)
+        return 1
 
     jobs = max(1, min(args.jobs, 8, len(picked)))
     if args.fragments is None:

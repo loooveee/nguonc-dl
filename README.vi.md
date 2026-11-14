@@ -63,6 +63,7 @@ Xem trước khi tải:
 
 Mặc định luôn chọn chất lượng cao nhất. Đa số phim trên trang chỉ có một chất lượng (thường là 1080p);
 phim nào có nhiều bản thì đều được liệt kê, dùng `-q` để chọn bản khác.
+Nếu đổi `-q` khi một tập đang tải dở, tập đó sẽ được tải lại từ đầu với chất lượng mới.
 
 Khi đang tải:
 

@@ -63,6 +63,7 @@ Check before downloading:
 
 The highest quality is picked by default. Most movies on the site have a single quality
 (usually 1080p); when there are several, all of them are listed and `-q` picks another one.
+If you change `-q` while an episode is half downloaded, that episode starts over in the new quality.
 
 While downloading:
 
